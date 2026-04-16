@@ -1,0 +1,170 @@
+﻿<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>多期 Put 对冲实验室</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <main class="page">
+    <section class="panel panel-form">
+      <h1>多期 Put 对冲实验室</h1>
+      <p class="sub">支持固定换月、常期限滚动、阶梯到期、触发式续保四种方法。输入参数后即可比较多期对冲效果。</p>
+
+      <h2>价格路径</h2>
+      <div class="grid">
+        <label>起始标的价格 S0
+          <input id="spotIndex" type="number" step="0.01" value="8560.84">
+        </label>
+        <label>路径模式
+          <select id="pathMode">
+            <option value="gbm">随机路径(GBM)</option>
+            <option value="manual">手动收益率序列</option>
+          </select>
+        </label>
+        <label id="horizonWrap">模拟期数(月)
+          <input id="horizonMonths" type="number" step="1" value="24">
+        </label>
+        <label id="driftWrap">年化漂移
+          <input id="pathDrift" type="number" step="0.001" value="0.05">
+        </label>
+        <label id="pathVolWrap">路径年化波动率
+          <input id="pathVolatility" type="number" step="0.001" value="0.22">
+        </label>
+        <label id="seedWrap">随机种子
+          <input id="seed" type="number" step="1" value="42">
+        </label>
+      </div>
+      <label id="manualReturnsWrap" class="hidden">手动每期收益率(逗号分隔)
+        <textarea id="manualReturns" rows="4" placeholder="-0.03,0.02,-0.04,0.01,..."></textarea>
+      </label>
+
+      <h2>组合与对冲</h2>
+      <div class="grid">
+        <label>头寸金额(元)
+          <input id="portfolioValue" type="number" step="1" value="10000000">
+        </label>
+        <label>组合 Beta
+          <input id="portfolioBeta" type="number" step="0.01" value="1.0">
+        </label>
+        <label>对冲比例
+          <input id="hedgeRatio" type="number" step="0.01" value="1.0">
+        </label>
+        <label>基础保护 moneyness (K/S)
+          <input id="baseMoneyness" type="number" step="0.001" value="0.95">
+        </label>
+        <label>触发回撤阈值
+          <input id="triggerDrawdown" type="number" step="0.001" value="0.08">
+        </label>
+        <label>触发后 moneyness
+          <input id="triggerMoneyness" type="number" step="0.001" value="1.00">
+        </label>
+      </div>
+
+      <h2>期权定价与续保规则</h2>
+      <div class="grid">
+        <label>无风险利率
+          <input id="riskFreeRate" type="number" step="0.001" value="0.015">
+        </label>
+        <label>股息率
+          <input id="dividendYield" type="number" step="0.001" value="0.0">
+        </label>
+        <label>期权年化波动率
+          <input id="optionVolatility" type="number" step="0.001" value="0.20">
+        </label>
+        <label>BS 溢价率
+          <input id="bsPremiumRate" type="number" step="0.001" value="0.0">
+        </label>
+        <label>执行价档位步长
+          <input id="strikeStep" type="number" step="1" value="100">
+        </label>
+        <label>合约乘数
+          <input id="contractMultiplier" type="number" step="1" value="100">
+        </label>
+        <label>单期合约期限(月)
+          <input id="tenorMonths" type="number" step="1" value="3">
+        </label>
+        <label>提前展期阈值(月)
+          <input id="rollBeforeExpiryMonths" type="number" step="1" value="1">
+        </label>
+        <label>阶梯期限(月,逗号)
+          <input id="ladderMonths" type="text" value="1,2,3">
+        </label>
+        <label>手续费(元/张)
+          <input id="feePerContract" type="number" step="0.01" value="0">
+        </label>
+        <label>滑点(元/张)
+          <input id="slippagePerContract" type="number" step="0.01" value="0">
+        </label>
+      </div>
+
+      <h2>分析方法</h2>
+      <div class="checks">
+        <label><input id="mFixed" type="checkbox" checked> 固定换月 `fixed_roll`</label>
+        <label><input id="mConst" type="checkbox" checked> 常期限滚动 `constant_maturity`</label>
+        <label><input id="mLadder" type="checkbox" checked> 阶梯到期 `ladder`</label>
+        <label><input id="mTrigger" type="checkbox" checked> 触发式续保 `drawdown_trigger`</label>
+      </div>
+
+      <div class="actions">
+        <button id="runBtn" type="button">运行多期分析</button>
+      </div>
+      <p id="errorMsg" class="error"></p>
+    </section>
+
+    <section class="panel panel-result">
+      <h2>方法对比摘要</h2>
+      <div class="table-wrap">
+        <table id="summaryTable">
+          <thead>
+            <tr>
+              <th>方法</th>
+              <th>最终对冲PnL</th>
+              <th>最终改进</th>
+              <th>最大损失</th>
+              <th>CVaR95</th>
+              <th>下跌损失降幅</th>
+              <th>总开仓成本</th>
+              <th>交易次数</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+
+      <h2>路径与净值曲线</h2>
+      <div class="chart-toolbar">
+        <label>查看方法
+          <select id="chartMethod"></select>
+        </label>
+      </div>
+      <svg id="curveChart" viewBox="0 0 960 420" preserveAspectRatio="none"></svg>
+      <p class="sub">图中包含：未对冲 PnL、对冲后 PnL、标的价格（右轴归一化）。</p>
+
+      <h2>交易明细</h2>
+      <div class="table-wrap">
+        <table id="tradeTable">
+          <thead>
+            <tr>
+              <th>step</th>
+              <th>action</th>
+              <th>reason</th>
+              <th>spot</th>
+              <th>strike</th>
+              <th>contracts</th>
+              <th>expiry</th>
+              <th>premium(points)</th>
+              <th>cashflow</th>
+              <th>exercised</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <script src="./app.js"></script>
+</body>
+</html>
