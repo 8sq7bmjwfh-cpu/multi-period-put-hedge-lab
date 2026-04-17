@@ -133,3 +133,5 @@ python multi_period_put_hedge.py \
 网站访问地址：
 
 - https://8sq7bmjwfh-cpu.github.io/multi-period-put-hedge-lab/
+
+部署触发时间（UTC）：2026-04-17
