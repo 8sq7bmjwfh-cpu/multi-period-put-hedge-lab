@@ -9,6 +9,15 @@ from pathlib import Path
 from statistics import mean
 
 METHODS = ("fixed_roll", "constant_maturity", "ladder", "drawdown_trigger")
+TRADING_DAYS_PER_YEAR = 252.0
+SHOCK_SUMMARY_FIELDS = (
+    "pre_avg_improvement",
+    "shock_avg_improvement",
+    "post_avg_improvement",
+    "pre_downside_reduction_ratio",
+    "shock_downside_reduction_ratio",
+    "post_downside_reduction_ratio",
+)
 
 
 @dataclass
@@ -34,9 +43,9 @@ class HedgeParams:
 
 @dataclass
 class SimulationParams:
-    tenor_months: int = 3
-    roll_before_expiry_months: int = 1
-    ladder_months: tuple[int, ...] = (1, 2, 3)
+    tenor_days: int = 63
+    roll_before_expiry_days: int = 21
+    ladder_days: tuple[int, ...] = (21, 42, 63)
     bs_premium_rate: float = 0.0
 
 
@@ -104,10 +113,10 @@ def parse_int_list(text: str) -> list[int]:
             continue
         value = int(item)
         if value <= 0:
-            raise ValueError("ladder months must be > 0")
+            raise ValueError("ladder days must be > 0")
         out.append(value)
     if not out:
-        raise ValueError("ladder months cannot be empty")
+        raise ValueError("ladder days cannot be empty")
     return sorted(set(out))
 
 
@@ -117,22 +126,29 @@ def generate_gbm_path(
     annual_drift: float,
     annual_volatility: float,
     seed: int,
+    path_count: int = 100,
 ) -> list[float]:
     if steps < 1:
         raise ValueError("steps must be >= 1")
     if annual_volatility <= 0:
         raise ValueError("annual_volatility must be > 0")
-    rng = random.Random(seed)
-    dt = 1.0 / 12.0
-    prices = [spot0]
-    for _ in range(steps):
-        z = rng.gauss(0.0, 1.0)
-        growth = math.exp(
-            (annual_drift - 0.5 * annual_volatility * annual_volatility) * dt
-            + annual_volatility * math.sqrt(dt) * z
-        )
-        prices.append(prices[-1] * growth)
-    return prices
+    if path_count < 1:
+        raise ValueError("path_count must be >= 1")
+    dt = 1.0 / TRADING_DAYS_PER_YEAR
+    spot_sums = [0.0 for _ in range(steps + 1)]
+    for path_idx in range(path_count):
+        rng = random.Random(seed + path_idx * 100003)
+        spot = spot0
+        spot_sums[0] += spot
+        for step in range(1, steps + 1):
+            z = rng.gauss(0.0, 1.0)
+            growth = math.exp(
+                (annual_drift - 0.5 * annual_volatility * annual_volatility) * dt
+                + annual_volatility * math.sqrt(dt) * z
+            )
+            spot *= growth
+            spot_sums[step] += spot
+    return [v / path_count for v in spot_sums]
 
 
 def build_path_from_returns(spot0: float, returns: list[float]) -> list[float]:
@@ -142,6 +158,112 @@ def build_path_from_returns(spot0: float, returns: list[float]) -> list[float]:
     for r in returns:
         prices.append(prices[-1] * (1.0 + r))
     return prices
+
+
+def apply_drawdown_shock(
+    price_path: list[float],
+    shock_start_day: int,
+    shock_duration_days: int,
+    shock_total_drop: float,
+    shock_recovery_days: int = 0,
+    shock_recovery_ratio: float = 0.0,
+) -> tuple[list[float], dict]:
+    n = len(price_path) - 1
+    if n < 1:
+        raise ValueError("price_path must include at least 1 simulated day")
+    if not (1 <= shock_start_day <= n):
+        raise ValueError("shock_start_day must be in [1, horizon_days]")
+    if shock_duration_days < 1:
+        raise ValueError("shock_duration_days must be >= 1")
+    shock_end_day = shock_start_day + shock_duration_days - 1
+    if shock_end_day > n:
+        raise ValueError("shock window exceeds horizon_days")
+    if not (0.0 < shock_total_drop < 1.0):
+        raise ValueError("shock_total_drop must be in (0, 1)")
+    if shock_recovery_days < 0:
+        raise ValueError("shock_recovery_days must be >= 0")
+    if not (0.0 <= shock_recovery_ratio <= 1.0):
+        raise ValueError("shock_recovery_ratio must be in [0, 1]")
+
+    shocked = list(price_path)
+    floor_factor = 1.0 - shock_total_drop
+    per_day_drop_factor = floor_factor ** (1.0 / shock_duration_days)
+
+    # Apply a progressive drawdown shock in the shock window, then keep the dropped level.
+    for day in range(shock_start_day, n + 1):
+        if day <= shock_end_day:
+            k = day - shock_start_day + 1
+            factor = per_day_drop_factor ** k
+        else:
+            factor = floor_factor
+        shocked[day] = price_path[day] * factor
+
+    recovery_end_day = shock_end_day
+    if shock_recovery_days > 0 and shock_recovery_ratio > 0:
+        recovery_start_day = shock_end_day + 1
+        recovery_end_day = min(n, shock_end_day + shock_recovery_days)
+        recovered_factor = floor_factor + shock_total_drop * shock_recovery_ratio
+        for day in range(recovery_start_day, recovery_end_day + 1):
+            frac = (day - recovery_start_day + 1) / shock_recovery_days
+            factor = floor_factor + (recovered_factor - floor_factor) * frac
+            shocked[day] = price_path[day] * factor
+        for day in range(recovery_end_day + 1, n + 1):
+            shocked[day] = price_path[day] * recovered_factor
+
+    shock_info = {
+        "shock_start_day": shock_start_day,
+        "shock_end_day": shock_end_day,
+        "shock_duration_days": shock_duration_days,
+        "shock_total_drop": shock_total_drop,
+        "shock_recovery_days": shock_recovery_days,
+        "shock_recovery_ratio": shock_recovery_ratio,
+        "shock_recovery_end_day": recovery_end_day,
+    }
+    return shocked, shock_info
+
+
+def compute_period_metrics(states: list[dict]) -> dict:
+    if not states:
+        return {"avg_improvement": 0.0, "downside_reduction_ratio": 0.0}
+    unhedged = [row["unhedged_pnl"] for row in states]
+    hedged = [row["hedged_pnl"] for row in states]
+    improvements = [h - u for h, u in zip(hedged, unhedged)]
+    worst_unhedged = min(unhedged)
+    worst_hedged = min(hedged)
+    reduction = 0.0
+    if worst_unhedged < 0:
+        reduction = 1.0 - abs(worst_hedged) / abs(worst_unhedged)
+    return {
+        "avg_improvement": mean(improvements),
+        "downside_reduction_ratio": reduction,
+    }
+
+
+def enrich_summary_with_shock_periods(
+    summary: dict,
+    states: list[dict],
+    shock_start_day: int,
+    shock_end_day: int,
+) -> None:
+    pre_states = [row for row in states if row["step"] < shock_start_day]
+    shock_states = [row for row in states if shock_start_day <= row["step"] <= shock_end_day]
+    post_states = [row for row in states if row["step"] > shock_end_day]
+
+    pre = compute_period_metrics(pre_states)
+    in_shock = compute_period_metrics(shock_states)
+    post = compute_period_metrics(post_states)
+
+    summary["pre_avg_improvement"] = round(pre["avg_improvement"], 6)
+    summary["shock_avg_improvement"] = round(in_shock["avg_improvement"], 6)
+    summary["post_avg_improvement"] = round(post["avg_improvement"], 6)
+    summary["pre_downside_reduction_ratio"] = round(pre["downside_reduction_ratio"], 8)
+    summary["shock_downside_reduction_ratio"] = round(in_shock["downside_reduction_ratio"], 8)
+    summary["post_downside_reduction_ratio"] = round(post["downside_reduction_ratio"], 8)
+
+
+def fill_shock_period_defaults(summary: dict) -> None:
+    for field in SHOCK_SUMMARY_FIELDS:
+        summary[field] = 0.0
 
 
 def option_mtm_points(lot: OptionLot, spot: float, step: int, market: MarketParams) -> float:
@@ -154,7 +276,7 @@ def option_mtm_points(lot: OptionLot, spot: float, step: int, market: MarketPara
         risk_free_rate=market.risk_free_rate,
         dividend_yield=market.dividend_yield,
         volatility=market.option_volatility,
-        maturity_years=remaining_steps / 12.0,
+        maturity_years=remaining_steps / TRADING_DAYS_PER_YEAR,
     )
 
 
@@ -195,8 +317,8 @@ def simulate_method(
     trade_rows: list[dict] = []
     lot_counter = 1
 
-    ladder_months = tuple(sorted(set(sim.ladder_months)))
-    ladder_weight = 1.0 / len(ladder_months)
+    ladder_days = tuple(sorted(set(sim.ladder_days)))
+    ladder_weight = 1.0 / len(ladder_days)
 
     def contracts_for_weight(strike: float, weight: float) -> int:
         target_exposure = exposure * hedge.hedge_ratio * weight
@@ -233,7 +355,7 @@ def simulate_method(
     def open_lot(
         step: int,
         spot: float,
-        tenor_months: int,
+        tenor_days: int,
         moneyness: float,
         weight: float,
         reason: str,
@@ -241,7 +363,7 @@ def simulate_method(
         nonlocal cash_account, lot_counter
         strike = round_to_step(spot * moneyness, market.strike_step)
         contracts = contracts_for_weight(strike, weight)
-        maturity_years = tenor_months / 12.0
+        maturity_years = tenor_days / TRADING_DAYS_PER_YEAR
         premium_points = bs_put_points(
             spot=spot,
             strike=strike,
@@ -258,7 +380,7 @@ def simulate_method(
         lot = OptionLot(
             lot_id=lot_counter,
             strike=strike,
-            expiry_step=step + tenor_months,
+            expiry_step=step + tenor_days,
             contracts=contracts,
             moneyness=moneyness,
             weight=weight,
@@ -325,10 +447,10 @@ def simulate_method(
         )
 
     if method == "ladder":
-        for tenor in ladder_months:
+        for tenor in ladder_days:
             open_lot(0, spot0, tenor, hedge.base_moneyness, ladder_weight, "init_ladder")
     else:
-        open_lot(0, spot0, sim.tenor_months, hedge.base_moneyness, 1.0, "init_single")
+        open_lot(0, spot0, sim.tenor_days, hedge.base_moneyness, 1.0, "init_single")
 
     record_state(0, spot0)
 
@@ -339,25 +461,25 @@ def simulate_method(
 
         if method == "fixed_roll":
             if not open_lots:
-                open_lot(step, spot, sim.tenor_months, hedge.base_moneyness, 1.0, "roll_after_expiry")
+                open_lot(step, spot, sim.tenor_days, hedge.base_moneyness, 1.0, "roll_after_expiry")
 
         elif method == "constant_maturity":
             if not open_lots:
-                open_lot(step, spot, sim.tenor_months, hedge.base_moneyness, 1.0, "reopen_missing")
+                open_lot(step, spot, sim.tenor_days, hedge.base_moneyness, 1.0, "reopen_missing")
             else:
                 current = open_lots[0]
                 remaining = current.expiry_step - step
-                if remaining <= sim.roll_before_expiry_months:
+                if remaining <= sim.roll_before_expiry_days:
                     close_lot(step, spot, current, "early_roll_constant_maturity")
                     open_lots.remove(current)
-                    open_lot(step, spot, sim.tenor_months, hedge.base_moneyness, 1.0, "open_after_early_roll")
+                    open_lot(step, spot, sim.tenor_days, hedge.base_moneyness, 1.0, "open_after_early_roll")
 
         elif method == "ladder":
             for _ in range(expired_count):
                 open_lot(
                     step,
                     spot,
-                    max(ladder_months),
+                    max(ladder_days),
                     hedge.base_moneyness,
                     ladder_weight,
                     "ladder_replace",
@@ -371,17 +493,17 @@ def simulate_method(
                 else hedge.base_moneyness
             )
             if not open_lots:
-                open_lot(step, spot, sim.tenor_months, target_moneyness, 1.0, "reopen_missing")
+                open_lot(step, spot, sim.tenor_days, target_moneyness, 1.0, "reopen_missing")
             else:
                 current = open_lots[0]
                 remaining = current.expiry_step - step
                 trigger_changed = abs(current.moneyness - target_moneyness) > 1e-12
-                near_expiry = remaining <= sim.roll_before_expiry_months
+                near_expiry = remaining <= sim.roll_before_expiry_days
                 if near_expiry or trigger_changed:
                     reason = "drawdown_regime_roll" if trigger_changed else "early_roll_before_expiry"
                     close_lot(step, spot, current, reason)
                     open_lots.remove(current)
-                    open_lot(step, spot, sim.tenor_months, target_moneyness, 1.0, "open_after_trigger")
+                    open_lot(step, spot, sim.tenor_days, target_moneyness, 1.0, "open_after_trigger")
 
         record_state(step, spot)
 
@@ -437,10 +559,14 @@ def run_multi_method_analysis(
     market: MarketParams,
     hedge: HedgeParams,
     sim: SimulationParams,
+    shock_window: tuple[int, int] | None = None,
 ) -> dict[str, dict]:
     results: dict[str, dict] = {}
     for method in methods:
         state_rows, trade_rows, summary = simulate_method(method, price_path, market, hedge, sim)
+        fill_shock_period_defaults(summary)
+        if shock_window is not None:
+            enrich_summary_with_shock_periods(summary, state_rows, shock_window[0], shock_window[1])
         results[method] = {
             "states": state_rows,
             "trades": trade_rows,
@@ -474,10 +600,10 @@ def validate_inputs(
         raise ValueError("trigger_moneyness must be > 0")
     if hedge.trigger_drawdown <= 0:
         raise ValueError("trigger_drawdown must be > 0")
-    if sim.tenor_months <= 0:
-        raise ValueError("tenor_months must be > 0")
-    if sim.roll_before_expiry_months < 0:
-        raise ValueError("roll_before_expiry_months must be >= 0")
+    if sim.tenor_days <= 0:
+        raise ValueError("tenor_days must be > 0")
+    if sim.roll_before_expiry_days < 0:
+        raise ValueError("roll_before_expiry_days must be >= 0")
     if sim.bs_premium_rate <= -1:
         raise ValueError("bs_premium_rate must be > -1")
     if not methods:
@@ -492,12 +618,18 @@ def build_parser() -> argparse.ArgumentParser:
         description="Multi-period put hedge simulator with rolling strategies."
     )
     parser.add_argument("--spot-index", type=float, default=8560.84)
-    parser.add_argument("--path-mode", choices=["gbm", "manual"], default="gbm")
+    parser.add_argument("--path-mode", choices=["gbm", "gbm_shock", "manual"], default="gbm")
     parser.add_argument("--manual-returns", type=str, default="")
-    parser.add_argument("--horizon-months", type=int, default=24)
+    parser.add_argument("--horizon-days", type=int, default=252)
     parser.add_argument("--path-drift", type=float, default=0.05)
     parser.add_argument("--path-volatility", type=float, default=0.22)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--gbm-path-count", type=int, default=100)
+    parser.add_argument("--shock-start-day", type=int, default=84)
+    parser.add_argument("--shock-duration-days", type=int, default=21)
+    parser.add_argument("--shock-total-drop", type=float, default=0.18)
+    parser.add_argument("--shock-recovery-days", type=int, default=63)
+    parser.add_argument("--shock-recovery-ratio", type=float, default=0.5)
 
     parser.add_argument("--portfolio-value", type=float, default=10_000_000)
     parser.add_argument("--portfolio-beta", type=float, default=1.0)
@@ -510,12 +642,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--contract-multiplier", type=float, default=100)
     parser.add_argument("--bs-premium-rate", type=float, default=0.0)
 
-    parser.add_argument("--tenor-months", type=int, default=3)
-    parser.add_argument("--roll-before-expiry-months", type=int, default=1)
+    parser.add_argument("--tenor-days", type=int, default=63)
+    parser.add_argument("--roll-before-expiry-days", type=int, default=21)
     parser.add_argument("--base-moneyness", type=float, default=0.95)
     parser.add_argument("--trigger-drawdown", type=float, default=0.08)
     parser.add_argument("--trigger-moneyness", type=float, default=1.00)
-    parser.add_argument("--ladder-months", type=str, default="1,2,3")
+    parser.add_argument("--ladder-days", type=str, default="21,42,63")
 
     parser.add_argument("--fee-per-contract", type=float, default=0.0)
     parser.add_argument("--slippage-per-contract", type=float, default=0.0)
@@ -534,7 +666,7 @@ def main() -> None:
     args = build_parser().parse_args()
 
     methods = [m.strip() for m in args.methods.split(",") if m.strip()]
-    ladder_months = tuple(parse_int_list(args.ladder_months))
+    ladder_days = tuple(parse_int_list(args.ladder_days))
 
     market = MarketParams(
         risk_free_rate=args.risk_free_rate,
@@ -554,35 +686,73 @@ def main() -> None:
         slippage_per_contract=args.slippage_per_contract,
     )
     sim = SimulationParams(
-        tenor_months=args.tenor_months,
-        roll_before_expiry_months=args.roll_before_expiry_months,
-        ladder_months=ladder_months,
+        tenor_days=args.tenor_days,
+        roll_before_expiry_days=args.roll_before_expiry_days,
+        ladder_days=ladder_days,
         bs_premium_rate=args.bs_premium_rate,
     )
 
     validate_inputs(args.spot_index, methods, market, hedge, sim)
+    if args.path_mode in {"gbm", "gbm_shock"} and args.gbm_path_count < 1:
+        raise ValueError("gbm_path_count must be >= 1")
+    if args.path_mode in {"gbm", "gbm_shock"} and args.horizon_days < 1:
+        raise ValueError("horizon_days must be >= 1")
 
+    shock_info: dict | None = None
     if args.path_mode == "manual":
         returns = parse_float_list(args.manual_returns)
         price_path = build_path_from_returns(args.spot_index, returns)
     else:
-        price_path = generate_gbm_path(
+        base_path = generate_gbm_path(
             spot0=args.spot_index,
-            steps=args.horizon_months,
+            steps=args.horizon_days,
             annual_drift=args.path_drift,
             annual_volatility=args.path_volatility,
             seed=args.seed,
+            path_count=args.gbm_path_count,
+        )
+        if args.path_mode == "gbm_shock":
+            price_path, shock_info = apply_drawdown_shock(
+                price_path=base_path,
+                shock_start_day=args.shock_start_day,
+                shock_duration_days=args.shock_duration_days,
+                shock_total_drop=args.shock_total_drop,
+                shock_recovery_days=args.shock_recovery_days,
+                shock_recovery_ratio=args.shock_recovery_ratio,
+            )
+        else:
+            price_path = base_path
+
+    shock_window: tuple[int, int] | None = None
+    if shock_info is not None:
+        shock_window = (
+            int(shock_info["shock_start_day"]),
+            int(shock_info["shock_end_day"]),
         )
 
-    results = run_multi_method_analysis(methods, price_path, market, hedge, sim)
+    results = run_multi_method_analysis(methods, price_path, market, hedge, sim, shock_window=shock_window)
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     price_rows = []
     for i, spot in enumerate(price_path):
         ret = 0.0 if i == 0 else spot / price_path[i - 1] - 1.0
-        price_rows.append({"step": i, "spot": round(spot, 6), "step_return": round(ret, 8)})
-    save_csv(args.out_dir / "price_path.csv", price_rows, ["step", "spot", "step_return"])
+        price_rows.append({"day": i, "spot": round(spot, 6), "day_return": round(ret, 8)})
+    save_csv(args.out_dir / "price_path.csv", price_rows, ["day", "spot", "day_return"])
+    if shock_info is not None:
+        save_csv(
+            args.out_dir / "shock_info.csv",
+            [shock_info],
+            [
+                "shock_start_day",
+                "shock_end_day",
+                "shock_duration_days",
+                "shock_total_drop",
+                "shock_recovery_days",
+                "shock_recovery_ratio",
+                "shock_recovery_end_day",
+            ],
+        )
 
     summary_rows = []
     for method in methods:
@@ -645,6 +815,7 @@ def main() -> None:
             "avg_upside_drag",
             "total_open_cost",
             "trade_count",
+            *SHOCK_SUMMARY_FIELDS,
         ],
     )
 
@@ -652,18 +823,43 @@ def main() -> None:
     print("多期 Put 对冲滚动分析已完成")
     print("=" * 96)
     print(f"路径模式: {args.path_mode}")
-    print(f"情景步数: {len(price_path) - 1}")
+    if args.path_mode in {"gbm", "gbm_shock"}:
+        print(f"GBM均值路径样本数: {args.gbm_path_count}")
+    if shock_info is not None:
+        print(
+            "回撤冲击: "
+            f"开始日={shock_info['shock_start_day']} "
+            f"持续={shock_info['shock_duration_days']}天 "
+            f"总跌幅={shock_info['shock_total_drop']:.1%} "
+            f"修复天数={shock_info['shock_recovery_days']} "
+            f"修复比例={shock_info['shock_recovery_ratio']:.1%}"
+        )
+    print(f"仿真天数: {len(price_path) - 1}")
     print(f"方法列表: {', '.join(methods)}")
     print(f"输出目录: {args.out_dir.resolve()}")
     print("-" * 96)
     for row in summary_rows:
-        print(
+        base_line = (
             f"{row['method']:<20} "
             f"最终对冲PnL={row['final_hedged_pnl']:>14,.0f}  "
             f"最终改进={row['final_improvement']:>12,.0f}  "
             f"最大损失={row['max_loss_hedged']:>12,.0f}  "
             f"CVaR95={row['cvar95_loss_hedged']:>12,.0f}"
         )
+        print(base_line)
+        if shock_info is not None:
+            print(
+                " " * 20
+                + f"回撤前均改进={row['pre_avg_improvement']:>11,.0f}  "
+                + f"回撤中均改进={row['shock_avg_improvement']:>11,.0f}  "
+                + f"回撤后均改进={row['post_avg_improvement']:>11,.0f}"
+            )
+            print(
+                " " * 20
+                + f"回撤前下行降幅={row['pre_downside_reduction_ratio']:>9.1%}  "
+                + f"回撤中下行降幅={row['shock_downside_reduction_ratio']:>9.1%}  "
+                + f"回撤后下行降幅={row['post_downside_reduction_ratio']:>9.1%}"
+            )
 
 
 if __name__ == "__main__":

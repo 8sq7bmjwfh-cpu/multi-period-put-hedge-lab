@@ -24,11 +24,44 @@ function parseIntList(text) {
     .map((s) => Number(s));
   arr.forEach((v) => {
     if (!Number.isInteger(v) || v <= 0) {
-      throw new Error("阶梯期限必须是正整数列表，如 1,2,3");
+      throw new Error("阶梯期限必须是正整数列表，如 21,42,63");
     }
   });
   return [...new Set(arr)].sort((a, b) => a - b);
 }
+
+const TRADING_DAYS_PER_YEAR = 252;
+const SHOCK_PRESETS = {
+  mild: {
+    startRatio: 0.38,
+    durationRatio: 0.06,
+    totalDrop: 0.10,
+    recoveryDurationRatio: 0.16,
+    recoveryRatio: 0.80,
+  },
+  moderate: {
+    startRatio: 0.33,
+    durationRatio: 0.08,
+    totalDrop: 0.18,
+    recoveryDurationRatio: 0.25,
+    recoveryRatio: 0.50,
+  },
+  extreme: {
+    startRatio: 0.28,
+    durationRatio: 0.12,
+    totalDrop: 0.30,
+    recoveryDurationRatio: 0.30,
+    recoveryRatio: 0.25,
+  },
+};
+const SHOCK_FIELD_IDS = [
+  "shockStartDay",
+  "shockDurationDays",
+  "shockTotalDrop",
+  "shockRecoveryDays",
+  "shockRecoveryRatio",
+];
+let IS_APPLYING_SHOCK_PRESET = false;
 
 function mulberry32(seed) {
   let t = seed >>> 0;
@@ -48,21 +81,29 @@ function normalFromUniform(rand) {
   return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
 }
 
-function generateGbmPath(spot0, steps, annualDrift, annualVolatility, seed) {
+function generateGbmPath(spot0, steps, annualDrift, annualVolatility, seed, pathCount = 100) {
   if (steps < 1) throw new Error("模拟期数必须 >= 1");
   if (annualVolatility <= 0) throw new Error("路径年化波动率必须 > 0");
-  const rand = mulberry32(Math.floor(seed));
-  const dt = 1 / 12;
-  const prices = [spot0];
-  for (let i = 0; i < steps; i += 1) {
-    const z = normalFromUniform(rand);
-    const growth = Math.exp(
-      (annualDrift - 0.5 * annualVolatility * annualVolatility) * dt
-      + annualVolatility * Math.sqrt(dt) * z
-    );
-    prices.push(prices[prices.length - 1] * growth);
+  if (!Number.isInteger(pathCount) || pathCount < 1) {
+    throw new Error("GBM均值样本路径数必须是正整数");
   }
-  return prices;
+  const dt = 1 / TRADING_DAYS_PER_YEAR;
+  const sums = Array.from({ length: steps + 1 }, () => 0);
+  for (let p = 0; p < pathCount; p += 1) {
+    const rand = mulberry32(Math.floor(seed + p * 100003));
+    let spot = spot0;
+    sums[0] += spot;
+    for (let i = 1; i <= steps; i += 1) {
+      const z = normalFromUniform(rand);
+      const growth = Math.exp(
+        (annualDrift - 0.5 * annualVolatility * annualVolatility) * dt
+        + annualVolatility * Math.sqrt(dt) * z
+      );
+      spot *= growth;
+      sums[i] += spot;
+    }
+  }
+  return sums.map((v) => v / pathCount);
 }
 
 function buildPathFromReturns(spot0, returns) {
@@ -72,6 +113,78 @@ function buildPathFromReturns(spot0, returns) {
     prices.push(prices[prices.length - 1] * (1 + r));
   });
   return prices;
+}
+
+function applyDrawdownShock(
+  pricePath,
+  shockStartDay,
+  shockDurationDays,
+  shockTotalDrop,
+  shockRecoveryDays = 0,
+  shockRecoveryRatio = 0
+) {
+  const n = pricePath.length - 1;
+  if (n < 1) throw new Error("价格路径至少要包含 1 个模拟日");
+  if (!Number.isInteger(shockStartDay) || shockStartDay < 1 || shockStartDay > n) {
+    throw new Error("冲击开始日必须在 [1, 模拟天数] 范围内");
+  }
+  if (!Number.isInteger(shockDurationDays) || shockDurationDays < 1) {
+    throw new Error("冲击持续天数必须是正整数");
+  }
+  const shockEndDay = shockStartDay + shockDurationDays - 1;
+  if (shockEndDay > n) {
+    throw new Error("冲击窗口超出模拟天数，请缩短持续天数或提前冲击开始日");
+  }
+  if (!(shockTotalDrop > 0 && shockTotalDrop < 1)) {
+    throw new Error("冲击总跌幅必须在 (0,1) 内");
+  }
+  if (!Number.isInteger(shockRecoveryDays) || shockRecoveryDays < 0) {
+    throw new Error("冲击后修复天数必须是非负整数");
+  }
+  if (!(shockRecoveryRatio >= 0 && shockRecoveryRatio <= 1)) {
+    throw new Error("修复比例必须在 [0,1] 内");
+  }
+
+  const shocked = [...pricePath];
+  const floorFactor = 1 - shockTotalDrop;
+  const perDayDropFactor = Math.pow(floorFactor, 1 / shockDurationDays);
+
+  for (let day = shockStartDay; day <= n; day += 1) {
+    let factor = floorFactor;
+    if (day <= shockEndDay) {
+      const k = day - shockStartDay + 1;
+      factor = Math.pow(perDayDropFactor, k);
+    }
+    shocked[day] = pricePath[day] * factor;
+  }
+
+  let shockRecoveryEndDay = shockEndDay;
+  if (shockRecoveryDays > 0 && shockRecoveryRatio > 0) {
+    const recoveryStartDay = shockEndDay + 1;
+    shockRecoveryEndDay = Math.min(n, shockEndDay + shockRecoveryDays);
+    const recoveredFactor = floorFactor + shockTotalDrop * shockRecoveryRatio;
+    for (let day = recoveryStartDay; day <= shockRecoveryEndDay; day += 1) {
+      const frac = (day - recoveryStartDay + 1) / shockRecoveryDays;
+      const factor = floorFactor + (recoveredFactor - floorFactor) * frac;
+      shocked[day] = pricePath[day] * factor;
+    }
+    for (let day = shockRecoveryEndDay + 1; day <= n; day += 1) {
+      shocked[day] = pricePath[day] * recoveredFactor;
+    }
+  }
+
+  return {
+    shockedPath: shocked,
+    shockInfo: {
+      shockStartDay,
+      shockEndDay,
+      shockDurationDays,
+      shockTotalDrop,
+      shockRecoveryDays,
+      shockRecoveryRatio,
+      shockRecoveryEndDay,
+    },
+  };
 }
 
 function erf(x) {
@@ -119,7 +232,7 @@ function optionMtmPoints(lot, spot, step, cfg) {
     cfg.riskFreeRate,
     cfg.dividendYield,
     cfg.optionVolatility,
-    remain / 12
+    remain / TRADING_DAYS_PER_YEAR
   );
 }
 
@@ -141,6 +254,91 @@ function calcCvarLoss(curve, alpha = 0.95) {
   return tail.reduce((acc, x) => acc + x, 0) / tail.length;
 }
 
+const METHOD_LABELS = {
+  fixed_roll: "固定续保",
+  constant_maturity: "常期限滚动",
+  ladder: "阶梯到期",
+  drawdown_trigger: "触发式续保",
+};
+
+const ACTION_LABELS = {
+  OPEN: "开仓",
+  CLOSE: "平仓",
+  EXPIRE: "到期结算",
+};
+
+const REASON_LABELS = {
+  init_ladder: "初始化阶梯组合",
+  init_single: "初始化单笔建仓",
+  roll_after_expiry: "到期后续保",
+  reopen_missing: "无持仓重建",
+  early_roll_constant_maturity: "常期限提前展期",
+  open_after_early_roll: "提前展期后开仓",
+  ladder_replace: "阶梯到期补仓",
+  drawdown_regime_roll: "回撤触发换仓",
+  early_roll_before_expiry: "到期前提前展期",
+  open_after_trigger: "触发后开仓",
+  expiry_settlement: "到期结算",
+};
+
+function methodLabel(method) {
+  return METHOD_LABELS[method] || method;
+}
+
+function actionLabel(action) {
+  return ACTION_LABELS[action] || action;
+}
+
+function reasonLabel(reason) {
+  return REASON_LABELS[reason] || reason;
+}
+
+function avg(arr) {
+  return arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0;
+}
+
+function computePeriodMetrics(states) {
+  if (!states.length) {
+    return { avgImprovement: 0, downsideReductionRatio: 0 };
+  }
+  const unhedged = states.map((row) => row.unhedgedPnl);
+  const hedged = states.map((row) => row.hedgedPnl);
+  const improvements = states.map((row) => row.improvement);
+  const worstUnhedged = Math.min(...unhedged);
+  const worstHedged = Math.min(...hedged);
+  let reduction = 0;
+  if (worstUnhedged < 0) {
+    reduction = 1 - Math.abs(worstHedged) / Math.abs(worstUnhedged);
+  }
+  return { avgImprovement: avg(improvements), downsideReductionRatio: reduction };
+}
+
+function fillShockPeriodDefaults(summary) {
+  summary.preAvgImprovement = 0;
+  summary.shockAvgImprovement = 0;
+  summary.postAvgImprovement = 0;
+  summary.preDownsideReductionRatio = 0;
+  summary.shockDownsideReductionRatio = 0;
+  summary.postDownsideReductionRatio = 0;
+}
+
+function enrichSummaryWithShockPeriods(summary, states, shockStartDay, shockEndDay) {
+  const preStates = states.filter((row) => row.step < shockStartDay);
+  const shockStates = states.filter((row) => row.step >= shockStartDay && row.step <= shockEndDay);
+  const postStates = states.filter((row) => row.step > shockEndDay);
+
+  const pre = computePeriodMetrics(preStates);
+  const inShock = computePeriodMetrics(shockStates);
+  const post = computePeriodMetrics(postStates);
+
+  summary.preAvgImprovement = pre.avgImprovement;
+  summary.shockAvgImprovement = inShock.avgImprovement;
+  summary.postAvgImprovement = post.avgImprovement;
+  summary.preDownsideReductionRatio = pre.downsideReductionRatio;
+  summary.shockDownsideReductionRatio = inShock.downsideReductionRatio;
+  summary.postDownsideReductionRatio = post.downsideReductionRatio;
+}
+
 function simulateMethod(method, pricePath, cfg) {
   const exposure = cfg.portfolioValue * cfg.portfolioBeta;
   const spot0 = pricePath[0];
@@ -151,7 +349,7 @@ function simulateMethod(method, pricePath, cfg) {
   const trades = [];
   let lotCounter = 1;
 
-  const ladderWeight = 1 / cfg.ladderMonths.length;
+  const ladderWeight = 1 / cfg.ladderDays.length;
 
   function contractsForWeight(strike, weight) {
     const targetExposure = exposure * cfg.hedgeRatio * weight;
@@ -175,7 +373,7 @@ function simulateMethod(method, pricePath, cfg) {
     });
   }
 
-  function openLot(step, spot, tenorMonths, moneyness, weight, reason) {
+  function openLot(step, spot, tenorDays, moneyness, weight, reason) {
     const strike = roundToStep(spot * moneyness, cfg.strikeStep);
     const contracts = contractsForWeight(strike, weight);
     const premiumPoints =
@@ -185,7 +383,7 @@ function simulateMethod(method, pricePath, cfg) {
         cfg.riskFreeRate,
         cfg.dividendYield,
         cfg.optionVolatility,
-        tenorMonths / 12
+        tenorDays / TRADING_DAYS_PER_YEAR
       ) * (1 + cfg.bsPremiumRate);
 
     const outflow = contracts * (
@@ -195,7 +393,7 @@ function simulateMethod(method, pricePath, cfg) {
     const lot = {
       lotId: lotCounter,
       strike,
-      expiryStep: step + tenorMonths,
+      expiryStep: step + tenorDays,
       contracts,
       moneyness,
       weight,
@@ -249,11 +447,11 @@ function simulateMethod(method, pricePath, cfg) {
   }
 
   if (method === "ladder") {
-    cfg.ladderMonths.forEach((tenor) => {
+    cfg.ladderDays.forEach((tenor) => {
       openLot(0, spot0, tenor, cfg.baseMoneyness, ladderWeight, "init_ladder");
     });
   } else {
-    openLot(0, spot0, cfg.tenorMonths, cfg.baseMoneyness, 1, "init_single");
+    openLot(0, spot0, cfg.tenorDays, cfg.baseMoneyness, 1, "init_single");
   }
 
   recordState(0, spot0);
@@ -265,18 +463,18 @@ function simulateMethod(method, pricePath, cfg) {
 
     if (method === "fixed_roll") {
       if (!openLots.length) {
-        openLot(step, spot, cfg.tenorMonths, cfg.baseMoneyness, 1, "roll_after_expiry");
+        openLot(step, spot, cfg.tenorDays, cfg.baseMoneyness, 1, "roll_after_expiry");
       }
     } else if (method === "constant_maturity") {
       if (!openLots.length) {
-        openLot(step, spot, cfg.tenorMonths, cfg.baseMoneyness, 1, "reopen_missing");
+        openLot(step, spot, cfg.tenorDays, cfg.baseMoneyness, 1, "reopen_missing");
       } else {
         const current = openLots[0];
         const remaining = current.expiryStep - step;
-        if (remaining <= cfg.rollBeforeExpiryMonths) {
+        if (remaining <= cfg.rollBeforeExpiryDays) {
           closeLot(step, spot, current, "early_roll_constant_maturity");
           openLots.splice(0, 1);
-          openLot(step, spot, cfg.tenorMonths, cfg.baseMoneyness, 1, "open_after_early_roll");
+          openLot(step, spot, cfg.tenorDays, cfg.baseMoneyness, 1, "open_after_early_roll");
         }
       }
     } else if (method === "ladder") {
@@ -284,7 +482,7 @@ function simulateMethod(method, pricePath, cfg) {
         openLot(
           step,
           spot,
-          cfg.ladderMonths[cfg.ladderMonths.length - 1],
+          cfg.ladderDays[cfg.ladderDays.length - 1],
           cfg.baseMoneyness,
           ladderWeight,
           "ladder_replace"
@@ -294,16 +492,16 @@ function simulateMethod(method, pricePath, cfg) {
       const drawdown = spot / peakSpot - 1;
       const targetMoneyness = drawdown <= -cfg.triggerDrawdown ? cfg.triggerMoneyness : cfg.baseMoneyness;
       if (!openLots.length) {
-        openLot(step, spot, cfg.tenorMonths, targetMoneyness, 1, "reopen_missing");
+        openLot(step, spot, cfg.tenorDays, targetMoneyness, 1, "reopen_missing");
       } else {
         const current = openLots[0];
         const remaining = current.expiryStep - step;
         const triggerChanged = Math.abs(current.moneyness - targetMoneyness) > 1e-12;
-        const nearExpiry = remaining <= cfg.rollBeforeExpiryMonths;
+        const nearExpiry = remaining <= cfg.rollBeforeExpiryDays;
         if (triggerChanged || nearExpiry) {
           closeLot(step, spot, current, triggerChanged ? "drawdown_regime_roll" : "early_roll_before_expiry");
           openLots.splice(0, 1);
-          openLot(step, spot, cfg.tenorMonths, targetMoneyness, 1, "open_after_trigger");
+          openLot(step, spot, cfg.tenorDays, targetMoneyness, 1, "open_after_trigger");
         }
       }
     }
@@ -333,8 +531,6 @@ function simulateMethod(method, pricePath, cfg) {
     .filter((t) => t.action === "OPEN")
     .reduce((acc, t) => acc + (-t.cashflow), 0);
 
-  const avg = (arr) => (arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0);
-
   const summary = {
     method,
     finalSpot: pricePath[pricePath.length - 1],
@@ -350,6 +546,7 @@ function simulateMethod(method, pricePath, cfg) {
     totalOpenCost,
     tradeCount: trades.length,
   };
+  fillShockPeriodDefaults(summary);
 
   return { states, trades, summary };
 }
@@ -364,14 +561,70 @@ function fmtPct(v, digits = 2) {
 
 let LAST_RESULT = null;
 
+function clamp(v, minV, maxV) {
+  return Math.min(maxV, Math.max(minV, v));
+}
+
+function buildShockParamsFromPreset(presetKey, horizonDays) {
+  const preset = SHOCK_PRESETS[presetKey];
+  if (!preset) return null;
+
+  const durationDays = clamp(Math.round(horizonDays * preset.durationRatio), 3, horizonDays);
+  const startMax = Math.max(1, horizonDays - durationDays + 1);
+  const startDay = clamp(Math.round(horizonDays * preset.startRatio), 1, startMax);
+  const endDay = startDay + durationDays - 1;
+  const recoveryCap = Math.max(0, horizonDays - endDay);
+  const recoveryDays = recoveryCap > 0
+    ? clamp(Math.round(horizonDays * preset.recoveryDurationRatio), 1, recoveryCap)
+    : 0;
+
+  return {
+    shockStartDay: startDay,
+    shockDurationDays: durationDays,
+    shockTotalDrop: preset.totalDrop,
+    shockRecoveryDays: recoveryDays,
+    shockRecoveryRatio: preset.recoveryRatio,
+  };
+}
+
+function applyShockPreset(presetKey) {
+  const horizonRaw = toNum("horizonDays");
+  const horizonDays = Number.isFinite(horizonRaw) && horizonRaw >= 1
+    ? Math.floor(horizonRaw)
+    : 252;
+  const params = buildShockParamsFromPreset(presetKey, horizonDays);
+  if (!params) return;
+  IS_APPLYING_SHOCK_PRESET = true;
+  document.getElementById("shockStartDay").value = String(params.shockStartDay);
+  document.getElementById("shockDurationDays").value = String(params.shockDurationDays);
+  document.getElementById("shockTotalDrop").value = params.shockTotalDrop.toFixed(3);
+  document.getElementById("shockRecoveryDays").value = String(params.shockRecoveryDays);
+  document.getElementById("shockRecoveryRatio").value = params.shockRecoveryRatio.toFixed(3);
+  IS_APPLYING_SHOCK_PRESET = false;
+}
+
+function markShockPresetAsCustom() {
+  if (IS_APPLYING_SHOCK_PRESET) return;
+  const presetSel = document.getElementById("shockPreset");
+  if (presetSel.value !== "custom") {
+    presetSel.value = "custom";
+  }
+}
+
 function readConfig() {
   const cfg = {
     spotIndex: toNum("spotIndex"),
     pathMode: document.getElementById("pathMode").value,
-    horizonMonths: toNum("horizonMonths"),
+    horizonDays: toNum("horizonDays"),
     pathDrift: toNum("pathDrift"),
     pathVolatility: toNum("pathVolatility"),
     seed: toNum("seed"),
+    gbmPathCount: toNum("gbmPathCount"),
+    shockStartDay: toNum("shockStartDay"),
+    shockDurationDays: toNum("shockDurationDays"),
+    shockTotalDrop: toNum("shockTotalDrop"),
+    shockRecoveryDays: toNum("shockRecoveryDays"),
+    shockRecoveryRatio: toNum("shockRecoveryRatio"),
     manualReturns: parseFloatList(document.getElementById("manualReturns").value),
 
     portfolioValue: toNum("portfolioValue"),
@@ -385,12 +638,12 @@ function readConfig() {
     strikeStep: toNum("strikeStep"),
     contractMultiplier: toNum("contractMultiplier"),
 
-    tenorMonths: toNum("tenorMonths"),
-    rollBeforeExpiryMonths: toNum("rollBeforeExpiryMonths"),
+    tenorDays: toNum("tenorDays"),
+    rollBeforeExpiryDays: toNum("rollBeforeExpiryDays"),
     baseMoneyness: toNum("baseMoneyness"),
     triggerDrawdown: toNum("triggerDrawdown"),
     triggerMoneyness: toNum("triggerMoneyness"),
-    ladderMonths: parseIntList(document.getElementById("ladderMonths").value),
+    ladderDays: parseIntList(document.getElementById("ladderDays").value),
 
     feePerContract: toNum("feePerContract"),
     slippagePerContract: toNum("slippagePerContract"),
@@ -410,8 +663,16 @@ function readConfig() {
   if (!cfg.methods.length) throw new Error("至少选择一个分析方法");
   if (cfg.spotIndex <= 0) throw new Error("起始标的价格必须 > 0");
   if (cfg.optionVolatility <= 0 || cfg.pathVolatility <= 0) throw new Error("波动率必须 > 0");
-  if (cfg.horizonMonths < 1) throw new Error("模拟期数必须 >= 1");
+  if (cfg.horizonDays < 1) throw new Error("模拟天数必须 >= 1");
+  if (cfg.tenorDays <= 0) throw new Error("单期合约期限(天)必须 > 0");
+  if (cfg.rollBeforeExpiryDays < 0) throw new Error("提前展期阈值(天)必须 >= 0");
   if (cfg.bsPremiumRate <= -1) throw new Error("BS溢价率必须 > -1");
+  if (!Number.isInteger(cfg.gbmPathCount) || cfg.gbmPathCount < 1) {
+    throw new Error("GBM均值样本路径数必须是正整数");
+  }
+  if (!Number.isInteger(cfg.shockStartDay)) throw new Error("冲击开始日必须是整数");
+  if (!Number.isInteger(cfg.shockDurationDays)) throw new Error("冲击持续天数必须是整数");
+  if (!Number.isInteger(cfg.shockRecoveryDays)) throw new Error("冲击后修复天数必须是整数");
 
   if (cfg.pathMode === "manual") {
     if (!cfg.manualReturns.length) throw new Error("手动路径模式下，收益率序列不能为空");
@@ -421,14 +682,50 @@ function readConfig() {
     });
   }
 
+  if (cfg.pathMode === "gbm_shock") {
+    if (cfg.shockStartDay < 1 || cfg.shockStartDay > cfg.horizonDays) {
+      throw new Error("冲击开始日必须在 [1, 模拟天数] 内");
+    }
+    if (cfg.shockDurationDays < 1) throw new Error("冲击持续天数必须 >= 1");
+    if (cfg.shockStartDay + cfg.shockDurationDays - 1 > cfg.horizonDays) {
+      throw new Error("冲击窗口超出模拟天数");
+    }
+    if (!(cfg.shockTotalDrop > 0 && cfg.shockTotalDrop < 1)) {
+      throw new Error("冲击总跌幅必须在 (0,1) 内");
+    }
+    if (cfg.shockRecoveryDays < 0) throw new Error("冲击后修复天数必须 >= 0");
+    if (!(cfg.shockRecoveryRatio >= 0 && cfg.shockRecoveryRatio <= 1)) {
+      throw new Error("修复比例必须在 [0,1] 内");
+    }
+  }
+
   return cfg;
 }
 
 function buildPricePath(cfg) {
   if (cfg.pathMode === "manual") {
-    return buildPathFromReturns(cfg.spotIndex, cfg.manualReturns);
+    return { pricePath: buildPathFromReturns(cfg.spotIndex, cfg.manualReturns), shockInfo: null };
   }
-  return generateGbmPath(cfg.spotIndex, cfg.horizonMonths, cfg.pathDrift, cfg.pathVolatility, cfg.seed);
+  const basePath = generateGbmPath(
+    cfg.spotIndex,
+    cfg.horizonDays,
+    cfg.pathDrift,
+    cfg.pathVolatility,
+    cfg.seed,
+    cfg.gbmPathCount
+  );
+  if (cfg.pathMode === "gbm_shock") {
+    const { shockedPath, shockInfo } = applyDrawdownShock(
+      basePath,
+      cfg.shockStartDay,
+      cfg.shockDurationDays,
+      cfg.shockTotalDrop,
+      cfg.shockRecoveryDays,
+      cfg.shockRecoveryRatio
+    );
+    return { pricePath: shockedPath, shockInfo };
+  }
+  return { pricePath: basePath, shockInfo: null };
 }
 
 function renderSummaryTable(summaryRows) {
@@ -437,7 +734,7 @@ function renderSummaryTable(summaryRows) {
   summaryRows.forEach((row) => {
     const tr = document.createElement("tr");
     tr.innerHTML = `
-      <td>${row.method}</td>
+      <td>${methodLabel(row.method)}</td>
       <td>${fmtMoney(row.finalHedgedPnl)}</td>
       <td>${fmtMoney(row.finalImprovement)}</td>
       <td>${fmtMoney(row.maxLossHedged)}</td>
@@ -445,6 +742,12 @@ function renderSummaryTable(summaryRows) {
       <td>${fmtPct(row.downsideReductionRatio)}</td>
       <td>${fmtMoney(row.totalOpenCost)}</td>
       <td>${row.tradeCount}</td>
+      <td>${fmtMoney(row.preAvgImprovement)}</td>
+      <td>${fmtMoney(row.shockAvgImprovement)}</td>
+      <td>${fmtMoney(row.postAvgImprovement)}</td>
+      <td>${fmtPct(row.preDownsideReductionRatio)}</td>
+      <td>${fmtPct(row.shockDownsideReductionRatio)}</td>
+      <td>${fmtPct(row.postDownsideReductionRatio)}</td>
     `;
     body.appendChild(tr);
   });
@@ -457,7 +760,7 @@ function renderMethodSelector(methods) {
   methods.forEach((m) => {
     const op = document.createElement("option");
     op.value = m;
-    op.textContent = m;
+    op.textContent = methodLabel(m);
     sel.appendChild(op);
   });
   if (methods.includes(old)) sel.value = old;
@@ -486,6 +789,7 @@ function renderCurveChart(method) {
   const svg = document.getElementById("curveChart");
   const rows = LAST_RESULT.results[method].states;
   const spotPath = LAST_RESULT.pricePath;
+  const shockInfo = LAST_RESULT.shockInfo;
 
   const width = 960;
   const height = 420;
@@ -534,6 +838,13 @@ function renderCurveChart(method) {
   html += `<line x1="${width - margin.right}" y1="${margin.top}" x2="${width - margin.right}" y2="${height - margin.bottom}" stroke="#7e7562"/>`;
   html += `<line x1="${margin.left}" y1="${height - margin.bottom}" x2="${width - margin.right}" y2="${height - margin.bottom}" stroke="#7e7562"/>`;
 
+  if (shockInfo) {
+    const x1 = mapX(shockInfo.shockStartDay);
+    const x2 = mapX(shockInfo.shockEndDay);
+    html += `<rect x="${x1}" y="${margin.top}" width="${Math.max(1, x2 - x1)}" height="${plotH}" fill="#ca7a1320" stroke="#ca7a13" stroke-width="1"/>`;
+    html += `<text x="${x1 + 4}" y="${margin.top + 14}" font-size="11" fill="#8a530a">回撤冲击区间</text>`;
+  }
+
   html += `<path d="${linePath(unhedgedPts)}" fill="none" stroke="#9b6a00" stroke-width="2.2"/>`;
   html += `<path d="${linePath(hedgedPts)}" fill="none" stroke="#1a7d62" stroke-width="2.4"/>`;
   html += `<path d="${linePath(spotPts)}" fill="none" stroke="#5d55a8" stroke-width="2" stroke-dasharray="6 4"/>`;
@@ -541,9 +852,9 @@ function renderCurveChart(method) {
   const zeroY = mapYL(0);
   html += `<line x1="${margin.left}" y1="${zeroY}" x2="${width - margin.right}" y2="${zeroY}" stroke="#b8afa0" stroke-dasharray="4 4"/>`;
 
-  html += `<text x="${margin.left}" y="14" font-size="12" fill="#1f1d18">未对冲PnL</text>`;
+  html += `<text x="${margin.left}" y="14" font-size="12" fill="#1f1d18">未对冲损益</text>`;
   html += `<line x1="${margin.left + 64}" y1="10" x2="${margin.left + 96}" y2="10" stroke="#9b6a00" stroke-width="2.2"/>`;
-  html += `<text x="${margin.left + 110}" y="14" font-size="12" fill="#1f1d18">对冲后PnL</text>`;
+  html += `<text x="${margin.left + 110}" y="14" font-size="12" fill="#1f1d18">对冲后损益</text>`;
   html += `<line x1="${margin.left + 176}" y1="10" x2="${margin.left + 208}" y2="10" stroke="#1a7d62" stroke-width="2.4"/>`;
   html += `<text x="${margin.left + 222}" y="14" font-size="12" fill="#1f1d18">标的价格</text>`;
   html += `<line x1="${margin.left + 276}" y1="10" x2="${margin.left + 308}" y2="10" stroke="#5d55a8" stroke-width="2" stroke-dasharray="6 4"/>`;
@@ -562,8 +873,8 @@ function renderTradeTable(method) {
     const tr = document.createElement("tr");
     tr.innerHTML = `
       <td>${t.step}</td>
-      <td>${t.action}</td>
-      <td>${t.reason}</td>
+      <td>${actionLabel(t.action)}</td>
+      <td>${reasonLabel(t.reason)}</td>
       <td>${t.spot.toFixed(2)}</td>
       <td>${t.strike.toFixed(2)}</td>
       <td>${t.contracts}</td>
@@ -582,17 +893,25 @@ function runAnalysis() {
 
   try {
     const cfg = readConfig();
-    const pricePath = buildPricePath(cfg);
+    const { pricePath, shockInfo } = buildPricePath(cfg);
     const results = {};
     const summaryRows = [];
 
     cfg.methods.forEach((m) => {
       const ret = simulateMethod(m, pricePath, cfg);
+      if (shockInfo) {
+        enrichSummaryWithShockPeriods(
+          ret.summary,
+          ret.states,
+          shockInfo.shockStartDay,
+          shockInfo.shockEndDay
+        );
+      }
       results[m] = ret;
       summaryRows.push(ret.summary);
     });
 
-    LAST_RESULT = { cfg, pricePath, results };
+    LAST_RESULT = { cfg, pricePath, shockInfo, results };
     renderSummaryTable(summaryRows);
     renderMethodSelector(cfg.methods);
 
@@ -608,15 +927,45 @@ function runAnalysis() {
 function togglePathMode() {
   const mode = document.getElementById("pathMode").value;
   const isManual = mode === "manual";
+  const isShock = mode === "gbm_shock";
   document.getElementById("manualReturnsWrap").classList.toggle("hidden", !isManual);
   document.getElementById("horizonWrap").classList.toggle("hidden", isManual);
   document.getElementById("driftWrap").classList.toggle("hidden", isManual);
   document.getElementById("pathVolWrap").classList.toggle("hidden", isManual);
   document.getElementById("seedWrap").classList.toggle("hidden", isManual);
+  document.getElementById("gbmCountWrap").classList.toggle("hidden", isManual);
+  document.getElementById("shockPresetWrap").classList.toggle("hidden", !isShock);
+  document.getElementById("shockStartWrap").classList.toggle("hidden", !isShock);
+  document.getElementById("shockDurationWrap").classList.toggle("hidden", !isShock);
+  document.getElementById("shockDropWrap").classList.toggle("hidden", !isShock);
+  document.getElementById("shockRecoveryDaysWrap").classList.toggle("hidden", !isShock);
+  document.getElementById("shockRecoveryRatioWrap").classList.toggle("hidden", !isShock);
+  if (isShock) {
+    const preset = document.getElementById("shockPreset").value;
+    if (preset !== "custom") {
+      applyShockPreset(preset);
+    }
+  }
 }
 
 document.getElementById("runBtn").addEventListener("click", runAnalysis);
 document.getElementById("pathMode").addEventListener("change", togglePathMode);
+document.getElementById("shockPreset").addEventListener("change", (e) => {
+  const preset = e.target.value;
+  if (preset !== "custom") {
+    applyShockPreset(preset);
+  }
+});
+document.getElementById("horizonDays").addEventListener("change", () => {
+  if (document.getElementById("pathMode").value !== "gbm_shock") return;
+  const preset = document.getElementById("shockPreset").value;
+  if (preset !== "custom") {
+    applyShockPreset(preset);
+  }
+});
+SHOCK_FIELD_IDS.forEach((id) => {
+  document.getElementById(id).addEventListener("input", markShockPresetAsCustom);
+});
 document.getElementById("chartMethod").addEventListener("change", (e) => {
   const method = e.target.value;
   renderCurveChart(method);

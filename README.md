@@ -10,18 +10,18 @@
 
 ## 已实现的 4 种方法
 
-1. `fixed_roll`（固定换月）
+1. `fixed_roll`（固定续保）
 - 持有到期后再开下一期。
 - 优点：规则简单，交易频率低。
 - 缺点：临近到期保护会衰减。
 
 2. `constant_maturity`（常期限滚动）
-- 到期前 `N` 个月提前平仓并重建同期限 Put。
+- 到期前 `N` 天提前平仓并重建同期限 Put。
 - 优点：保持相对稳定的剩余期限暴露。
 - 缺点：换仓更频繁，成本更高。
 
 3. `ladder`（阶梯到期）
-- 同时持有多个到期桶（如 1/2/3 月），到期后补最远端。
+- 同时持有多个到期桶（如 21/42/63 天），到期后补最远端。
 - 优点：平滑单一到期点风险。
 - 缺点：管理复杂度更高。
 
@@ -51,6 +51,16 @@
 3. 按策略规则决定是否展期/换仓。
 4. 记录状态（未对冲 PnL、对冲 PnL、现金账户、期权盯市、交易明细）。
 
+价格路径约定：
+
+- `gbm` 模式下，使用 **100 条几何布朗运动路径的逐期均值** 作为仿真价格路径（可通过参数调整样本数）。
+- `gbm_shock` 模式下，先生成 GBM 均值路径，再叠加“回撤冲击”：
+  - 冲击开始日 `shock_start_day`
+  - 冲击持续天数 `shock_duration_days`
+  - 冲击总跌幅 `shock_total_drop`
+  - 冲击后修复天数与修复比例（可选）
+- `manual` 模式下，按用户输入的每日收益率序列构造价格路径。
+
 输出指标包括：
 
 - 最终对冲 PnL 与最终改进
@@ -59,6 +69,9 @@
 - 下跌损失降幅
 - 总开仓成本
 - 交易次数
+- 若使用 `gbm_shock`，额外输出回撤前/回撤中/回撤后分段指标：
+  - 每段平均改进
+  - 每段下行损失降幅
 
 ---
 
@@ -67,19 +80,25 @@
 ```bash
 python multi_period_put_hedge.py \
   --spot-index 8560.84 \
-  --path-mode gbm \
-  --horizon-months 24 \
+  --path-mode gbm_shock \
+  --gbm-path-count 100 \
+  --horizon-days 252 \
   --path-drift 0.05 \
   --path-volatility 0.22 \
+  --shock-start-day 84 \
+  --shock-duration-days 21 \
+  --shock-total-drop 0.18 \
+  --shock-recovery-days 63 \
+  --shock-recovery-ratio 0.5 \
   --portfolio-value 10000000 \
   --portfolio-beta 1.0 \
   --hedge-ratio 1.0 \
-  --tenor-months 3 \
-  --roll-before-expiry-months 1 \
+  --tenor-days 63 \
+  --roll-before-expiry-days 21 \
   --base-moneyness 0.95 \
   --trigger-drawdown 0.08 \
   --trigger-moneyness 1.00 \
-  --ladder-months 1,2,3 \
+  --ladder-days 21,42,63 \
   --methods fixed_roll,constant_maturity,ladder,drawdown_trigger
 ```
 
@@ -87,6 +106,7 @@ python multi_period_put_hedge.py \
 
 - `price_path.csv`
 - `method_summary.csv`
+- `shock_info.csv`（仅 `gbm_shock` 模式）
 - `outputs/<method>/state_curve.csv`
 - `outputs/<method>/trades.csv`
 
@@ -109,3 +129,7 @@ python multi_period_put_hedge.py \
 - `.github/workflows/deploy-pages.yml`
 
 推送 `web/**`、工作流或 `README.md` 变更时自动部署。
+
+网站访问地址：
+
+- https://8sq7bmjwfh-cpu.github.io/multi-period-put-hedge-lab/

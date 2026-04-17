@@ -10,7 +10,7 @@
   <main class="page">
     <section class="panel panel-form">
       <h1>多期 Put 对冲实验室</h1>
-      <p class="sub">支持固定换月、常期限滚动、阶梯到期、触发式续保四种方法。输入参数后即可比较多期对冲效果。</p>
+      <p class="sub">支持固定续保、常期限滚动、阶梯到期、触发式续保四种方法。输入参数后即可比较多期对冲效果。</p>
 
       <h2>价格路径</h2>
       <div class="grid">
@@ -19,12 +19,13 @@
         </label>
         <label>路径模式
           <select id="pathMode">
-            <option value="gbm">随机路径(GBM)</option>
+            <option value="gbm">随机路径(几何布朗运动)</option>
+            <option value="gbm_shock">随机路径+回撤冲击</option>
             <option value="manual">手动收益率序列</option>
           </select>
         </label>
-        <label id="horizonWrap">模拟期数(月)
-          <input id="horizonMonths" type="number" step="1" value="24">
+        <label id="horizonWrap">模拟天数
+          <input id="horizonDays" type="number" step="1" value="252">
         </label>
         <label id="driftWrap">年化漂移
           <input id="pathDrift" type="number" step="0.001" value="0.05">
@@ -35,8 +36,34 @@
         <label id="seedWrap">随机种子
           <input id="seed" type="number" step="1" value="42">
         </label>
+        <label id="gbmCountWrap">GBM均值样本路径数
+          <input id="gbmPathCount" type="number" step="1" value="100">
+        </label>
+        <label id="shockPresetWrap" class="hidden">回撤冲击场景
+          <select id="shockPreset">
+            <option value="mild">轻度回撤</option>
+            <option value="moderate" selected>中度回撤</option>
+            <option value="extreme">极端回撤</option>
+            <option value="custom">自定义</option>
+          </select>
+        </label>
+        <label id="shockStartWrap" class="hidden">冲击开始日
+          <input id="shockStartDay" type="number" step="1" value="84">
+        </label>
+        <label id="shockDurationWrap" class="hidden">冲击持续天数
+          <input id="shockDurationDays" type="number" step="1" value="21">
+        </label>
+        <label id="shockDropWrap" class="hidden">冲击总跌幅(0~1)
+          <input id="shockTotalDrop" type="number" step="0.001" value="0.18">
+        </label>
+        <label id="shockRecoveryDaysWrap" class="hidden">冲击后修复天数
+          <input id="shockRecoveryDays" type="number" step="1" value="63">
+        </label>
+        <label id="shockRecoveryRatioWrap" class="hidden">修复比例(0~1)
+          <input id="shockRecoveryRatio" type="number" step="0.001" value="0.5">
+        </label>
       </div>
-      <label id="manualReturnsWrap" class="hidden">手动每期收益率(逗号分隔)
+      <label id="manualReturnsWrap" class="hidden">手动每日收益率(逗号分隔)
         <textarea id="manualReturns" rows="4" placeholder="-0.03,0.02,-0.04,0.01,..."></textarea>
       </label>
 
@@ -45,19 +72,19 @@
         <label>头寸金额(元)
           <input id="portfolioValue" type="number" step="1" value="10000000">
         </label>
-        <label>组合 Beta
+        <label>组合贝塔
           <input id="portfolioBeta" type="number" step="0.01" value="1.0">
         </label>
         <label>对冲比例
           <input id="hedgeRatio" type="number" step="0.01" value="1.0">
         </label>
-        <label>基础保护 moneyness (K/S)
+        <label>基础保护比例(执行价/现价)
           <input id="baseMoneyness" type="number" step="0.001" value="0.95">
         </label>
         <label>触发回撤阈值
           <input id="triggerDrawdown" type="number" step="0.001" value="0.08">
         </label>
-        <label>触发后 moneyness
+        <label>触发后保护比例
           <input id="triggerMoneyness" type="number" step="0.001" value="1.00">
         </label>
       </div>
@@ -82,14 +109,14 @@
         <label>合约乘数
           <input id="contractMultiplier" type="number" step="1" value="100">
         </label>
-        <label>单期合约期限(月)
-          <input id="tenorMonths" type="number" step="1" value="3">
+        <label>单期合约期限(天)
+          <input id="tenorDays" type="number" step="1" value="63">
         </label>
-        <label>提前展期阈值(月)
-          <input id="rollBeforeExpiryMonths" type="number" step="1" value="1">
+        <label>提前展期阈值(天)
+          <input id="rollBeforeExpiryDays" type="number" step="1" value="21">
         </label>
-        <label>阶梯期限(月,逗号)
-          <input id="ladderMonths" type="text" value="1,2,3">
+        <label>阶梯期限(天,逗号)
+          <input id="ladderDays" type="text" value="21,42,63">
         </label>
         <label>手续费(元/张)
           <input id="feePerContract" type="number" step="0.01" value="0">
@@ -101,10 +128,10 @@
 
       <h2>分析方法</h2>
       <div class="checks">
-        <label><input id="mFixed" type="checkbox" checked> 固定换月 `fixed_roll`</label>
-        <label><input id="mConst" type="checkbox" checked> 常期限滚动 `constant_maturity`</label>
-        <label><input id="mLadder" type="checkbox" checked> 阶梯到期 `ladder`</label>
-        <label><input id="mTrigger" type="checkbox" checked> 触发式续保 `drawdown_trigger`</label>
+        <label><input id="mFixed" type="checkbox" checked> 固定续保</label>
+        <label><input id="mConst" type="checkbox" checked> 常期限滚动</label>
+        <label><input id="mLadder" type="checkbox" checked> 阶梯到期</label>
+        <label><input id="mTrigger" type="checkbox" checked> 触发式续保</label>
       </div>
 
       <div class="actions">
@@ -120,13 +147,19 @@
           <thead>
             <tr>
               <th>方法</th>
-              <th>最终对冲PnL</th>
+              <th>最终对冲损益</th>
               <th>最终改进</th>
               <th>最大损失</th>
-              <th>CVaR95</th>
+              <th>95%条件风险价值</th>
               <th>下跌损失降幅</th>
               <th>总开仓成本</th>
               <th>交易次数</th>
+              <th>回撤前平均改进</th>
+              <th>回撤中平均改进</th>
+              <th>回撤后平均改进</th>
+              <th>回撤前下行降幅</th>
+              <th>回撤中下行降幅</th>
+              <th>回撤后下行降幅</th>
             </tr>
           </thead>
           <tbody></tbody>
@@ -140,23 +173,23 @@
         </label>
       </div>
       <svg id="curveChart" viewBox="0 0 960 420" preserveAspectRatio="none"></svg>
-      <p class="sub">图中包含：未对冲 PnL、对冲后 PnL、标的价格（右轴归一化）。</p>
+      <p class="sub">图中包含：未对冲损益、对冲后损益、标的价格（右轴归一化）；回撤冲击模式下会高亮冲击区间。</p>
 
       <h2>交易明细</h2>
       <div class="table-wrap">
         <table id="tradeTable">
           <thead>
             <tr>
-              <th>step</th>
-              <th>action</th>
-              <th>reason</th>
-              <th>spot</th>
-              <th>strike</th>
-              <th>contracts</th>
-              <th>expiry</th>
-              <th>premium(points)</th>
-              <th>cashflow</th>
-              <th>exercised</th>
+              <th>交易日序号</th>
+              <th>操作</th>
+              <th>原因</th>
+              <th>标的价格</th>
+              <th>执行价</th>
+              <th>合约张数</th>
+              <th>到期期数</th>
+              <th>价格(点/张)</th>
+              <th>现金流</th>
+              <th>是否行权</th>
             </tr>
           </thead>
           <tbody></tbody>
